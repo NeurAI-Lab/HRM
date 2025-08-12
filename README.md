@@ -1,4 +1,4 @@
-# Hierarchical Reasoning Model
+# Hierarchical Reasoning Model - multimodal
 
 ![](./assets/hrm.png)
 
