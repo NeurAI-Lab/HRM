@@ -76,7 +76,7 @@ class PuzzleDataset(IterableDataset):
         field_mmap_modes = {
             "inputs": "r",
             "labels": "r",
-
+            "images": "r",
             # Keep indices in memory
             "puzzle_identifiers": None,
             "puzzle_indices": None,
@@ -100,7 +100,8 @@ class PuzzleDataset(IterableDataset):
         if self.metadata.ignore_label_id is not None:
             batch["labels"][batch["labels"] == self.metadata.ignore_label_id] = IGNORE_LABEL_ID
 
-        # Pad
+        # Pad -- 
+        # TODO: Padding for images 
         if batch["puzzle_identifiers"].size < self.local_batch_size:
             pad_size = self.local_batch_size - batch["puzzle_identifiers"].size
 
@@ -111,7 +112,7 @@ class PuzzleDataset(IterableDataset):
                 "puzzle_identifiers": self.metadata.blank_identifier_id
             }
             batch = {k: np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=pad_values[k]) for k, v in batch.items()}
-
+    
         # To tensor
         return {k: torch.from_numpy(v) for k, v in batch.items()}
     
@@ -140,6 +141,7 @@ class PuzzleDataset(IterableDataset):
                 batch = self._collate_batch({
                     "inputs": dataset["inputs"][local_start: local_end],
                     "labels": dataset["labels"][local_start: local_end],
+                    "images": dataset["images"][local_start: local_end],
                     "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices]
                 })
 
@@ -181,6 +183,7 @@ class PuzzleDataset(IterableDataset):
                 batch = self._collate_batch({
                     "inputs": dataset["inputs"][batch_indices],
                     "labels": dataset["labels"][batch_indices],
+                    "images": dataset["images"][batch_indices],
                     "puzzle_identifiers": dataset["puzzle_identifiers"][batch_puzzle_indices]
                 })
 

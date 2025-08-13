@@ -10,9 +10,93 @@ from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 
 from common import PuzzleDatasetMetadata
-
+import numpy as np
+import cv2
+from concurrent.futures import ThreadPoolExecutor
 
 cli = ArgParser()
+
+
+
+class SudokuImageRenderer:
+    """
+    Render Sudoku puzzles (flattened 81 ints: 0=blank, 1..9=digits) to RGB images.
+
+    Args:
+        output_size: final side length of output image (e.g., 32 -> 32x32).
+        render_res: internal canvas side length for crisp glyphs (>= output_size).
+        line_thick: base grid line thickness at render_res (thicker 3x3 lines auto-handled).
+        font_scale: OpenCV font scale at render_res.
+        font_thick: OpenCV font thickness at render_res.
+    """
+    def __init__(self,
+                 output_size: int = 32,
+                 render_res: int = 144,
+                 line_thick: int = 2,
+                 font_scale: float = 0.5,
+                 font_thick: int = 1):
+        assert render_res % 9 == 0, "render_res should be divisible by 9"
+        self.output_size = int(output_size)
+        self.render_res = int(render_res)
+        self.cell = self.render_res // 9
+        self.line_thick = int(line_thick)
+        self.font_scale = float(font_scale)
+        self.font_thick = int(font_thick)
+        self.font = cv2.FONT_HERSHEY_SIMPLEX
+
+    def render_single(self, grid_flat: np.ndarray) -> np.ndarray:
+        """Returns (H, W, 3) uint8 image with H=W=output_size."""
+        img = np.full((self.render_res, self.render_res, 3), 255, np.uint8)
+
+        # Grid lines (thicker for 3x3 boundaries)
+        for i in range(10):
+            t = self.line_thick + (1 if i % 3 == 0 else 0)
+            y = i * self.cell
+            x = i * self.cell
+            cv2.line(img, (0, y), (self.render_res, y), (0, 0, 0), t)
+            cv2.line(img, (x, 0), (x, self.render_res), (0, 0, 0), t)
+
+        # Digits
+        for r in range(9):
+            for c in range(9):
+                v = int(grid_flat[r * 9 + c])
+                if v == 0 or v == 1: # The numbers are mapped from 1-->10 in this file, so ignore values < 2
+                    continue
+                text = str(v)
+                (tw, th), _ = cv2.getTextSize(text, self.font, self.font_scale, self.font_thick)
+                tx = c * self.cell + (self.cell - tw) // 2
+                ty = r * self.cell + (self.cell + th) // 2
+                cv2.putText(img, text, (tx, ty), self.font, self.font_scale, (0, 0, 0),
+                            self.font_thick, cv2.LINE_AA)
+
+        if self.output_size != self.render_res:
+            img = cv2.resize(img, (self.output_size, self.output_size), interpolation=cv2.INTER_AREA)
+        return img
+
+    def render_batch(self, inputs_np: np.ndarray, num_workers: int = 8) -> np.ndarray:
+        """
+        Threaded batch renderer with tqdm.
+        inputs_np: (N, 81) -> returns (N, 3, output_size, output_size) uint8
+        """
+        N = int(inputs_np.shape[0])
+
+        # sequential fallback (still shows progress)
+        if num_workers <= 1:
+            out = np.empty((N, self.output_size, self.output_size, 3), dtype=np.uint8)
+            for i in tqdm(range(N), desc="Creating images (1 thread)", unit="img"):
+                out[i] = self.render_single(inputs_np[i])
+            return np.transpose(out, (0, 3, 1, 2))
+
+        # multithreaded path (order-preserving)
+        with ThreadPoolExecutor(max_workers=num_workers) as ex:
+            # chunksize is optional; ignored by ThreadPoolExecutor in some Python versions
+            imgs_iter = ex.map(self.render_single, inputs_np, chunksize=64)
+            imgs = list(tqdm(imgs_iter, total=N,
+                            desc=f"Creating images ({num_workers} threads)", unit="img"))
+
+        out = np.stack(imgs, axis=0)  # (N, H, W, 3)
+        return np.transpose(out, (0, 3, 1, 2))
+
 
 
 class DataProcessConfig(BaseModel):
@@ -127,6 +211,10 @@ def convert_subset(set_name: str, config: DataProcessConfig):
         "puzzle_identifiers": np.array(results["puzzle_identifiers"], dtype=np.int32),
     }
 
+    # Render images
+    renderer = SudokuImageRenderer(output_size=224, render_res=288)
+    results["images"] = renderer.render_batch(results["inputs"])
+    
     # Metadata
     metadata = PuzzleDatasetMetadata(
         seq_len=81,
