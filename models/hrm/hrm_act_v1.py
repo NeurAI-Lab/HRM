@@ -16,6 +16,8 @@ from models.sparse_embedding import CastedSparseEmbedding
 class HierarchicalReasoningModel_ACTV1InnerCarry:
     z_H: torch.Tensor
     z_L: torch.Tensor
+    z_H_v: torch.Tensor
+    z_L_v: torch.Tensor
 
 
 @dataclass
@@ -34,6 +36,12 @@ class HierarchicalReasoningModel_ACTV1Config(BaseModel):
     puzzle_emb_ndim: int = 0
     num_puzzle_identifiers: int
     vocab_size: int
+
+    # --- vision input ---
+    img_size: int = 224           
+    img_channels: int = 3
+    patch_size: int = 16        
+    vision_pos_encodings: str = "learned"   
 
     H_cycles: int
     L_cycles: int
@@ -77,9 +85,15 @@ class HierarchicalReasoningModel_ACTV1Block(nn.Module):
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         # Post Norm
         # Self Attention
-        hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
+        hidden_states = rms_norm(
+            hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states),
+            variance_epsilon=self.norm_eps
+        )
         # Fully Connected
-        hidden_states = rms_norm(hidden_states + self.mlp(hidden_states), variance_epsilon=self.norm_eps)
+        hidden_states = rms_norm(
+            hidden_states + self.mlp(hidden_states),
+            variance_epsilon=self.norm_eps
+        )
         return hidden_states
 
 
@@ -133,15 +147,43 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         self.H_level = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config) for _i in range(self.config.H_layers)])
         self.L_level = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
         
-        # Initial states
-        # self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
-        # self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.H_level_v = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config) for _i in range(self.config.H_layers)])
+        self.L_level_v = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
+        
+        # -----------------------------
+        # Vision: patchify + pos + injector
+        # -----------------------------
+        assert (self.config.img_size % self.config.patch_size) == 0, "img_size must be divisible by patch_size"
+        self.vH = self.config.img_size // self.config.patch_size
+        self.vW = self.config.img_size // self.config.patch_size
+        self.v_num_patches = self.vH * self.vW
+        # Conv2d as patch embedding -> hidden_size channels
+        self.vision_patch_embed = nn.Conv2d(
+            in_channels=self.config.img_channels,
+            out_channels=self.config.hidden_size,
+            kernel_size=self.config.patch_size,
+            stride=self.config.patch_size,
+            bias=True,
+        )
+        if self.config.vision_pos_encodings == "learned":
+            self.vision_pos = nn.Parameter(
+                trunc_normal_init_(torch.empty(1, self.v_num_patches, self.config.hidden_size), std=0.02)
+            )
+        # Project a pooled visual token into per-token injection, then broadcast to seq_len+puzzle_emb_len
+        self.vision_to_seq = CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=True)
 
+        # Initial states
         h_init_tensor = trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1)
         self.register_buffer('H_init', h_init_tensor)
 
         l_init_tensor = trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1)
         self.register_buffer('L_init', l_init_tensor)
+        
+        h_v_init_tensor = trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1)
+        self.register_buffer('H_init_v', h_v_init_tensor)
+
+        l_v_init_tensor = trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1)
+        self.register_buffer('L_init_v', l_v_init_tensor)
 
         # Q head special init
         # Init Q to (almost) zero for faster learning during bootstrapping
@@ -171,16 +213,45 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         # Scale
         return self.embed_scale * embedding
 
+    def _image_embeddings(self, images: Optional[torch.Tensor]) -> torch.Tensor:
+        """
+        images: [B, C, H, W] uint8|float -> returns [B, (seq_len+puzzle_emb_len), hidden_size]
+        Implementation: patchify -> [B, P, H] add pos -> mean-pool -> project -> broadcast.
+        """
+        if images is None:
+            # zero injection if no images provided
+            B = 1
+            return torch.zeros((B, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size),
+                               dtype=self.forward_dtype, device=self.H_init.device)
+        x = images
+        if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            x = x.float()
+        # normalize to [0,1] if looks like 0..255
+        if x.max() > 1.5:
+            x = x / 255.0
+        x = self.vision_patch_embed(x)                         # [B, H, vH, vW]  (H == hidden_size)
+        x = x.flatten(2).transpose(1, 2)                       # [B, P, hidden]
+        if hasattr(self, "vision_pos"):
+            x = x + self.vision_pos.to(x.dtype)                # learned 2D pos
+        v_global = x.mean(dim=1)                               # [B, hidden]
+        inj = self.vision_to_seq(v_global.to(self.forward_dtype))  # [B, hidden]
+        inj = inj.unsqueeze(1).expand(-1, self.config.seq_len + self.puzzle_emb_len, -1)  # [B, T_txt, H]
+        return self.embed_scale * inj
+
     def empty_carry(self, batch_size: int):
         return HierarchicalReasoningModel_ACTV1InnerCarry(
-            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_H = torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_L = torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_H_v = torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_L_v = torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: HierarchicalReasoningModel_ACTV1InnerCarry):
         return HierarchicalReasoningModel_ACTV1InnerCarry(
-            z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
-            z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
+            z_H = torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
+            z_L = torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
+            z_H_v = torch.where(reset_flag.view(-1, 1, 1), self.H_init_v, carry.z_H_v),
+            z_L_v = torch.where(reset_flag.view(-1, 1, 1), self.L_init_v, carry.z_L_v),
         )
 
     def forward(self, carry: HierarchicalReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -190,31 +261,43 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
 
         # Input encoding
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        
+        # Vision injection (broadcasted to text length for compatibility with current *_v sequence shapes)
+        image_embeddings = self._image_embeddings(batch.get("images", None))
 
         # Forward iterations
         with torch.no_grad():
             z_H, z_L = carry.z_H, carry.z_L
+            z_H_v, z_L_v = carry.z_H_v, carry.z_L_v
 
             for _H_step in range(self.config.H_cycles):
                 for _L_step in range(self.config.L_cycles):
                     if not ((_H_step == self.config.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)):
-                        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                        z_L   = self.L_level(  z_L   + z_L_v, z_H   + z_H_v + input_embeddings, **seq_info)
+                        z_L_v = self.L_level_v(z_L_v, z_H_v + image_embeddings, **seq_info)
 
                 if not (_H_step == self.config.H_cycles - 1):
-                    z_H = self.H_level(z_H, z_L, **seq_info)
+                    z_H   = self.H_level(z_H + z_H_v, z_L + z_L_v, **seq_info)
+                    z_H_v = self.H_level_v(z_H_v, z_L_v, **seq_info)
 
-        assert not z_H.requires_grad and not z_L.requires_grad
+        assert (not z_H.requires_grad) and (not z_L.requires_grad) and (not z_L_v.requires_grad) and (not z_H_v.requires_grad)
 
         # 1-step grad
-        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-        z_H = self.H_level(z_H, z_L, **seq_info)
+        z_L   = self.L_level(z_L + z_L_v, z_H + z_H_v + input_embeddings, **seq_info)
+        z_H   = self.H_level(z_H + z_H_v, z_L + z_L_v, **seq_info)
+        
+        z_L_v = self.L_level_v(z_L_v, z_H_v + image_embeddings, **seq_info)
+        z_H_v = self.H_level_v(z_H_v, z_L_v, **seq_info)
 
         # LM Outputs
-        new_carry = HierarchicalReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
+        new_carry = HierarchicalReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), 
+                                                               z_L=z_L.detach(),
+                                                               z_L_v=z_L_v.detach(), 
+                                                               z_H_v=z_H_v.detach())
+        output = self.lm_head(z_H + z_H_v)[:, self.puzzle_emb_len:]
 
         # Q head
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
+        q_logits = self.q_head(z_H[:, 0]+ z_H_v[:, 0]).to(torch.float32)
         
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
