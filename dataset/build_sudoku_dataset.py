@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 
-from common import PuzzleDatasetMetadata
+from .common import PuzzleDatasetMetadata
 import numpy as np
 import cv2
 from concurrent.futures import ThreadPoolExecutor
@@ -73,7 +73,7 @@ class SudokuImageRenderer:
             img = cv2.resize(img, (self.output_size, self.output_size), interpolation=cv2.INTER_AREA)
         return img
 
-    def render_batch(self, inputs_np: np.ndarray, num_workers: int = 8) -> np.ndarray:
+    def render_batch(self, inputs_np: np.ndarray, num_workers: int = 32) -> np.ndarray:
         """
         Threaded batch renderer with tqdm.
         inputs_np: (N, 81) -> returns (N, 3, output_size, output_size) uint8
@@ -91,8 +91,7 @@ class SudokuImageRenderer:
         with ThreadPoolExecutor(max_workers=num_workers) as ex:
             # chunksize is optional; ignored by ThreadPoolExecutor in some Python versions
             imgs_iter = ex.map(self.render_single, inputs_np, chunksize=64)
-            imgs = list(tqdm(imgs_iter, total=N,
-                            desc=f"Creating images ({num_workers} threads)", unit="img"))
+            imgs = list(imgs_iter)
 
         out = np.stack(imgs, axis=0)  # (N, H, W, 3)
         return np.transpose(out, (0, 3, 1, 2))
@@ -211,9 +210,9 @@ def convert_subset(set_name: str, config: DataProcessConfig):
         "puzzle_identifiers": np.array(results["puzzle_identifiers"], dtype=np.int32),
     }
 
-    # Render images
-    renderer = SudokuImageRenderer(output_size=224, render_res=288)
-    results["images"] = renderer.render_batch(results["inputs"])
+    # # Render images --> Painfully slow and huge!! 
+    # renderer = SudokuImageRenderer(output_size=224, render_res=288)
+    # results["images"] = renderer.render_batch(results["inputs"])
     
     # Metadata
     metadata = PuzzleDatasetMetadata(

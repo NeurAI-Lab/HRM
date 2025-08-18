@@ -21,6 +21,8 @@ from adam_atan2 import AdamATan2
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
+from dataset.build_sudoku_dataset import SudokuImageRenderer
+
 
 
 class LossConfig(pydantic.BaseModel):
@@ -39,8 +41,14 @@ class ArchConfig(pydantic.BaseModel):
 class PretrainConfig(pydantic.BaseModel):
     # Config
     arch: ArchConfig
+    
     # Data
     data_path: str
+    dataset_name: str
+    
+    # Image rendering
+    render_res: int
+    output_size: int
 
     # Hyperparams
     global_batch_size: int
@@ -206,11 +214,16 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
     )
 
 
-def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
+def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int, renderer = None):
     train_state.step += 1
     if train_state.step > train_state.total_steps:  # At most train_total_steps
         return
 
+    # Create images
+    assert renderer is not None
+    batch["images"] = renderer.render_batch(batch["inputs"])
+    batch["images"] = torch.from_numpy(batch["images"])
+    
     # To device
     batch = {k: v.cuda() for k, v in batch.items()}
 
@@ -263,7 +276,8 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             return reduced_metrics
 
 
-def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch.utils.data.DataLoader, eval_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
+def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch.utils.data.DataLoader, 
+             eval_metadata: PuzzleDatasetMetadata, rank: int, world_size: int, renderer = None):
     with torch.inference_mode():
         set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
         
@@ -275,8 +289,14 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
         
         carry = None
         for set_name, batch, global_batch_size in eval_loader:
+            # Create images
+            assert renderer is not None
+            batch["images"] = renderer.render_batch(batch["inputs"])
+            batch["images"] = torch.from_numpy(batch["images"])
+            
             # To device
             batch = {k: v.cuda() for k, v in batch.items()}
+                        
             with torch.device("cuda"):
                 carry = train_state.model.initial_carry(batch)  # type: ignore
 
@@ -376,7 +396,21 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
 
     return objects[0]  # type: ignore
 
+def create_renderer(dataset_name: str, output_size=224, render_res=288, **kwargs):
+    renderers = {
+        "sudoku": SudokuImageRenderer(output_size=224, render_res=288),
+        # "maze": CrosswordImageRenderer,
+        # "arc": KakuroImageRenderer,
+    }
 
+    try:
+        return renderers[dataset_name.lower()]
+    except KeyError:
+        raise ValueError(
+            f"Unknown dataset: {dataset_name}. "
+            f"Available options: {list(renderers.keys())}"
+        )
+        
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
 def launch(hydra_config: DictConfig):
     RANK = 0
@@ -407,6 +441,9 @@ def launch(hydra_config: DictConfig):
     train_loader, train_metadata = create_dataloader(config, "train", test_set_mode=False, epochs_per_iter=train_epochs_per_iter, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
     eval_loader,  eval_metadata  = create_dataloader(config, "test", test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
+    # Image renderer 
+    renderer = create_renderer(config.dataset_name, config.output_size, config.render_res)
+    
     # Train state
     train_state = init_train_state(config, train_metadata, world_size=WORLD_SIZE)
 
@@ -426,7 +463,7 @@ def launch(hydra_config: DictConfig):
         ############ Train Iter
         train_state.model.train()
         for set_name, batch, global_batch_size in train_loader:
-            metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+            metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE, renderer=renderer)
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
@@ -434,7 +471,7 @@ def launch(hydra_config: DictConfig):
 
         ############ Evaluation
         train_state.model.eval()
-        metrics = evaluate(config, train_state, eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
+        metrics = evaluate(config, train_state, eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE, renderer=renderer)
 
         if RANK == 0 and metrics is not None:
             wandb.log(metrics, step=train_state.step)
