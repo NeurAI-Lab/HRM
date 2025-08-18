@@ -1,6 +1,7 @@
 #!/bin/bash
 # Define other parameters
 data_path='./data/sudoku-extreme-1k-aug-1000'
+dataset_name='sudoku'
 epochs=20000
 eval_interval=2000
 lr=0.0001
@@ -9,6 +10,9 @@ weight_decay=1
 puzzle_emb_weight_decay=1
 start_seed=50
 num_runs=1
+render_res=288
+output_size=224
+
 
 
 # Loop over all combinations
@@ -44,13 +48,16 @@ echo "MASTER_ADDR=\$MASTER_ADDR"
 
 # Run the Python script with the current parameters
 srun OMP_NUM_THREADS=96 torchrun --nproc-per-node 1 python /home/pbhat1/projects/NeurAI/HRM/pretrain.py \
-  --data_path $seed \
+  --data_path $data_path \
   --epochs $epochs \
   --eval_interval $eval_interval \
   --lr $lr \
   --puzzle_emb_lr $puzzle_emb_lr \
   --weight_decay $weight_decay \
   --puzzle_emb_weight_decay $puzzle_emb_weight_decay \
+  --dataset_name $dataset_name \
+  --render_res $render_res \
+  --output_size $output_size \
   
 EOF
       
