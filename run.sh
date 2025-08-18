@@ -12,6 +12,7 @@ start_seed=50
 num_runs=1
 render_res=288
 output_size=224
+global_batch_size=384
 
 
 
@@ -22,11 +23,11 @@ for seed in $(seq $start_seed $((start_seed + num_runs - 1))); do
     echo "Submitting job for combination: $exp_id"
     
     # Create a temporary script file
-    tmp_script=$(mktemp /home/pbhat1/projects/scripts/slurm_script.XXXXXX)
+    tmp_script=$(mktemp /home/pbhat1/projects/NeurAI/HRM/scripts/slurm_script.XXXXXX)
     cat <<EOF > "$tmp_script"
 #!/bin/bash
 #SBATCH --partition=gpu_mig
-#SBATCH --time=4:00:00
+#SBATCH --time=10:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
@@ -58,6 +59,7 @@ srun OMP_NUM_THREADS=96 torchrun --nproc-per-node 1 python /home/pbhat1/projects
   --dataset_name $dataset_name \
   --render_res $render_res \
   --output_size $output_size \
+  --global_batch_size $global_batch_size \
   
 EOF
       
