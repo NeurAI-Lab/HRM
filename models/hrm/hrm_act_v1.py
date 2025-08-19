@@ -38,9 +38,9 @@ class HierarchicalReasoningModel_ACTV1Config(BaseModel):
     vocab_size: int
 
     # --- vision input ---
-    img_size: int = 224           
-    img_channels: int = 3
-    patch_size: int = 16        
+    img_size: int            
+    img_channels: int  
+    patch_size: int          
     vision_pos_encodings: str = "learned"   
 
     H_cycles: int
@@ -273,8 +273,39 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
             for _H_step in range(self.config.H_cycles):
                 for _L_step in range(self.config.L_cycles):
                     if not ((_H_step == self.config.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)):
-                        z_L   = self.L_level(  z_L   + z_L_v, z_H   + z_H_v + input_embeddings, **seq_info)
-                        z_L_v = self.L_level_v(z_L_v, z_H_v + image_embeddings, **seq_info)
+                        use_cuda = z_L.is_cuda and torch.cuda.is_available()
+                        if use_cuda:
+                            s1 = torch.cuda.Stream(device=z_L.device)   # text stream
+                            s2 = torch.cuda.Stream(device=z_L.device)   # vision stream
+
+                            # Launch the two independent branches in parallel streams
+                            with torch.cuda.stream(s1):
+                                z_L_next = self.L_level(
+                                    z_L + z_L_v,
+                                    z_H + z_H_v + input_embeddings,
+                                    **seq_info
+                                )
+                            with torch.cuda.stream(s2):
+                                z_L_v_next = self.L_level_v(
+                                    z_L_v,
+                                    z_H_v + image_embeddings,
+                                    **seq_info
+                                )
+
+                            # Synchronize before consuming the results
+                            # e1 = torch.cuda.Event(enable_timing=False)
+                            # e2 = torch.cuda.Event(enable_timing=False)
+                            # e1.record(s1); e2.record(s2)
+                            # torch.cuda.current_stream().wait_event(e1)
+                            # torch.cuda.current_stream().wait_event(e2)
+                            
+                            torch.cuda.synchronize()
+                            z_L, z_L_v = z_L_next, z_L_v_next
+                        else:
+                            # CPU / non-CUDA fallback (sequential)
+                            z_L   = self.L_level(  z_L   + z_L_v, z_H   + z_H_v + input_embeddings, **seq_info)
+                            z_L_v = self.L_level_v(z_L_v,         z_H_v          + image_embeddings, **seq_info)
+
 
                 if not (_H_step == self.config.H_cycles - 1):
                     z_H   = self.H_level(z_H + z_H_v, z_L + z_L_v, **seq_info)
