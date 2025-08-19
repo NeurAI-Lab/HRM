@@ -26,6 +26,7 @@ for seed in $(seq $start_seed $((start_seed + num_runs - 1))); do
     tmp_script=$(mktemp /home/pbhat1/projects/NeurAI/HRM/scripts/slurm_script.XXXXXX)
     cat <<EOF > "$tmp_script"
 #!/bin/bash
+#SBATCH --reservation=jhs_tue2022
 #SBATCH --partition=gpu_mig
 #SBATCH --time=10:00:00
 #SBATCH --nodes=1
