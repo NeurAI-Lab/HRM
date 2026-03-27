@@ -9,6 +9,11 @@ hydra:
 
 # Data path
 data_path: data/arc-aug-1000
+dataset_name: sudoku
+
+# Image rendering
+render_res: 144
+output_size: 96
 
 # Hyperparams - Training
 global_batch_size: 768
